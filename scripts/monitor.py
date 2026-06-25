@@ -3,15 +3,13 @@
 FindingKuma - Periodic monitoring script for bear detection.
 
 Self-contained Python script for GitHub Actions / cron use.
-Fetches current camera images, runs YOLOv8 detection, and sends
+Fetches camera images, runs YOLOv8 detection, and sends
 Discord notifications on wildlife detections.
 
 Usage:
     python3 scripts/monitor.py --discord-webhook URL
-    python3 scripts/monitor.py --discord-webhook URL --notify-classes bear,wildlife
-    python3 scripts/monitor.py --source river          # river cameras only (default)
-    python3 scripts/monitor.py --source road           # road cameras only
-    python3 scripts/monitor.py --source all            # both
+    python3 scripts/monitor.py --discord-webhook URL --hours 1
+    python3 scripts/monitor.py --source all --dry-run
 
 Environment variables:
     DISCORD_WEBHOOK_URL  - Discord webhook URL (alternative to --discord-webhook)
@@ -89,15 +87,23 @@ def fetch_river_sites():
     return sorted(sites, key=lambda s: s["id"])
 
 
-def river_image_url(site_id):
-    """Build URL for the latest river camera image (rounded to 5 min)."""
+def build_river_schedule(site_id, hours):
+    """Build list of (timestamp, url) for the past N hours at 5-min intervals."""
     now = datetime.now(JST)
     rounded_min = (now.minute // 5) * 5
-    t = now.replace(minute=rounded_min, second=0, microsecond=0)
+    current = now.replace(minute=rounded_min, second=0, microsecond=0)
     sn = site_id.zfill(3)
-    date_str = t.strftime("%Y%m%d")
-    time_str = t.strftime("%Y%m%d%H%M")
-    return f"{RIVER_IMAGE_BASE}/{date_str}/{sn}/image_{sn}_{time_str}.jpg"
+
+    schedule = []
+    slots = int(hours * 12)  # 12 slots per hour (every 5 min)
+    for i in range(slots):
+        t = current - timedelta(minutes=i * 5)
+        date_str = t.strftime("%Y%m%d")
+        time_str = t.strftime("%Y%m%d%H%M")
+        url = f"{RIVER_IMAGE_BASE}/{date_str}/{sn}/image_{sn}_{time_str}.jpg"
+        schedule.append((t, url))
+
+    return schedule
 
 
 def download_image(url, dest_path):
@@ -116,13 +122,14 @@ def download_image(url, dest_path):
     return False
 
 
-def send_discord_notification(webhook_url, camera_name, detections, image_path, source_type):
+def send_discord_notification(webhook_url, camera_name, detections, image_path,
+                              source_type, timestamp=None):
     """Send a Discord webhook notification with detection results."""
     det_list = ", ".join(f"**{d['class']}** ({d['confidence']:.0%})" for d in detections)
-    now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
+    ts_str = timestamp.strftime("%Y/%m/%d %H:%M") if timestamp else datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 
     content = (
-        f"🐻 **検知アラート** - {now_jst} JST\n"
+        f"🐻 **検知アラート** - {ts_str} JST\n"
         f"📍 {camera_name} ({source_type})\n"
         f"🔍 {det_list}"
     )
@@ -219,12 +226,14 @@ def main():
                         help="Discord webhook URL")
     parser.add_argument("--source", default="river", choices=["river", "road", "all"],
                         help="Camera source (default: river)")
+    parser.add_argument("--hours", type=float, default=1,
+                        help="Hours of past images to scan (default: 1)")
     parser.add_argument("--confidence", type=float, default=0.3,
                         help="Detection confidence threshold (default: 0.3)")
     parser.add_argument("--classes", default="japan",
                         help="Class preset (default: japan)")
     parser.add_argument("--notify-classes", default="bear,wildlife",
-                        help="Classes to notify on: bear,wildlife,person,vehicle,all (comma-separated, default: bear,wildlife)")
+                        help="Classes to notify on (comma-separated, default: bear,wildlife)")
     parser.add_argument("--results-dir", default=None,
                         help="Directory to save detected images")
     parser.add_argument("--dry-run", action="store_true",
@@ -264,40 +273,8 @@ def main():
     print("Loading YOLOv8 model...")
     model = YOLO("yolov8n.pt")
 
-    # Collect cameras to scan
-    cameras = []
-
-    if args.source in ("river", "all"):
-        print("Fetching river camera list...")
-        try:
-            sites = fetch_river_sites()
-            for site in sites:
-                url = river_image_url(site["id"])
-                cameras.append({
-                    "id": site["id"],
-                    "name": f"{site['river']} {site['name']}",
-                    "url": url,
-                    "source": "river",
-                })
-            print(f"  {len(sites)} river cameras")
-        except Exception as e:
-            print(f"  Failed to fetch river sites: {e}", file=sys.stderr)
-
-    if args.source in ("road", "all"):
-        for cam_id, cam_name in ROAD_CAMERAS.items():
-            cameras.append({
-                "id": cam_id,
-                "name": cam_name,
-                "url": f"{ROAD_IMAGE_BASE}/{cam_id}.jpg",
-                "source": "road",
-            })
-        print(f"  {len(ROAD_CAMERAS)} road cameras")
-
     now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M JST")
-    print(f"\nMonitor scan: {len(cameras)} cameras at {now_str}")
-    print(f"  Classes: {args.classes}, Confidence: {args.confidence}")
-    print(f"  Notify on: {args.notify_classes}")
-    print()
+    slots = int(args.hours * 12)
 
     scanned = 0
     detected = 0
@@ -305,47 +282,112 @@ def main():
     errors = 0
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        for cam in cameras:
-            img_path = Path(tmpdir) / f"{cam['id']}.jpg"
+        # --- River cameras: batch scan past N hours ---
+        if args.source in ("river", "all"):
+            print("Fetching river camera list...")
+            try:
+                sites = fetch_river_sites()
+            except Exception as e:
+                print(f"  Failed to fetch river sites: {e}", file=sys.stderr)
+                sites = []
 
-            if not download_image(cam["url"], str(img_path)):
-                errors += 1
-                continue
+            total = len(sites) * slots
+            print(f"  {len(sites)} sites x {slots} images = {total} images")
+            print(f"  Range: past {args.hours}h (5-min intervals)")
+            print()
 
-            scanned += 1
-            detections = run_detection(model, str(img_path), target_classes, args.confidence)
+            count = 0
+            for site in sites:
+                schedule = build_river_schedule(site["id"], args.hours)
+                cam_name = f"{site['river']} {site['name']}"
 
-            if not detections:
-                print(f"  {cam['id']} {cam['name']}: -")
-                continue
+                for t, url in schedule:
+                    count += 1
+                    time_label = t.strftime("%H:%M")
+                    fname = f"{site['id']}_{t.strftime('%Y%m%d%H%M')}.jpg"
+                    img_path = Path(tmpdir) / fname
 
-            detected += 1
-            det_str = ", ".join(f"{d['class']}({d['confidence']})" for d in detections)
-            print(f"  {cam['id']} {cam['name']}: {det_str}")
+                    if not download_image(url, str(img_path)):
+                        errors += 1
+                        continue
 
-            # Check if any detection is notification-worthy
-            notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
+                    scanned += 1
+                    detections = run_detection(model, str(img_path), target_classes, args.confidence)
 
-            if notify_dets and args.discord_webhook and not args.dry_run:
-                # Save annotated image
-                annotated_path = Path(tmpdir) / f"detected_{cam['id']}.jpg"
-                annotate_image(str(img_path), detections, str(annotated_path))
+                    if not detections:
+                        continue
 
-                # Also save to results_dir if specified
-                if results_dir:
-                    ts = datetime.now(JST).strftime("%Y%m%d%H%M")
-                    save_path = results_dir / f"detected_{cam['id']}_{ts}.jpg"
-                    annotate_image(str(img_path), detections, str(save_path))
+                    detected += 1
+                    det_str = ", ".join(f"{d['class']}({d['confidence']})" for d in detections)
+                    progress = f"[{count}/{total}]"
+                    print(f"  {progress} {site['id']} {cam_name} {time_label}: {det_str}")
 
-                ok = send_discord_notification(
-                    args.discord_webhook, cam["name"], notify_dets,
-                    str(annotated_path), cam["source"],
-                )
-                if ok:
-                    notified += 1
-                    print(f"    -> Discord notification sent")
-                else:
-                    print(f"    -> Discord notification failed")
+                    # Check if any detection is notification-worthy
+                    notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
+
+                    if notify_dets:
+                        annotated_path = Path(tmpdir) / f"detected_{fname}"
+                        annotate_image(str(img_path), detections, str(annotated_path))
+
+                        if results_dir:
+                            save_path = results_dir / f"detected_{fname}"
+                            annotate_image(str(img_path), detections, str(save_path))
+
+                        if args.discord_webhook and not args.dry_run:
+                            ok = send_discord_notification(
+                                args.discord_webhook, cam_name, notify_dets,
+                                str(annotated_path), "river", timestamp=t,
+                            )
+                            if ok:
+                                notified += 1
+                                print(f"    -> Discord notification sent")
+                            else:
+                                print(f"    -> Discord notification failed")
+
+                    # Clean up image to save disk
+                    if img_path.exists() and not detections:
+                        img_path.unlink()
+
+        # --- Road cameras: current image only ---
+        if args.source in ("road", "all"):
+            print(f"Scanning {len(ROAD_CAMERAS)} road cameras (current image)...")
+
+            for cam_id, cam_name in ROAD_CAMERAS.items():
+                url = f"{ROAD_IMAGE_BASE}/{cam_id}.jpg"
+                img_path = Path(tmpdir) / f"{cam_id}.jpg"
+
+                if not download_image(url, str(img_path)):
+                    errors += 1
+                    continue
+
+                scanned += 1
+                detections = run_detection(model, str(img_path), target_classes, args.confidence)
+
+                if not detections:
+                    continue
+
+                detected += 1
+                det_str = ", ".join(f"{d['class']}({d['confidence']})" for d in detections)
+                print(f"  {cam_id} {cam_name}: {det_str}")
+
+                notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
+
+                if notify_dets:
+                    annotated_path = Path(tmpdir) / f"detected_{cam_id}.jpg"
+                    annotate_image(str(img_path), detections, str(annotated_path))
+
+                    if results_dir:
+                        ts = datetime.now(JST).strftime("%Y%m%d%H%M")
+                        save_path = results_dir / f"detected_{cam_id}_{ts}.jpg"
+                        annotate_image(str(img_path), detections, str(save_path))
+
+                    if args.discord_webhook and not args.dry_run:
+                        ok = send_discord_notification(
+                            args.discord_webhook, cam_name, notify_dets,
+                            str(annotated_path), "road",
+                        )
+                        if ok:
+                            notified += 1
 
     print()
     print("=" * 50)
