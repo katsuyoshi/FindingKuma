@@ -1,0 +1,187 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Batch scan: past N days of camera images for object detection with diff filtering.
+# Uses frame-difference to filter out static objects (text, buildings, bridges).
+#
+# Usage:
+#   ruby bin/batch_scan --days 30 --save-img
+#   ruby bin/batch_scan --days 7 --sites 050,022,014
+#   ruby bin/batch_scan --days 30 --classes wildlife
+#   ruby bin/batch_scan --days 1 --no-diff   # disable diff filtering
+
+require "optparse"
+require "time"
+require "fileutils"
+require_relative "../lib/finding_kuma/image_fetcher"
+require_relative "../lib/finding_kuma/detector"
+
+options = {
+  days: 30,
+  confidence: 0.25,
+  classes: "all",
+  save_img: true,
+  interval: 60,       # minutes between samples
+  hour_start: 5,
+  hour_end: 19,
+  sites: nil,
+  results_dir: File.expand_path("../results", __dir__),
+  diff: true,         # enable diff filtering by default
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: ruby bin/batch_scan [options]"
+
+  opts.on("--days N", Integer, "Days to scan back (default: 30)") { |v| options[:days] = v }
+  opts.on("--sites LIST", "Comma-separated site IDs (default: all)") { |v| options[:sites] = v.split(",").map { |s| s.strip.rjust(3, "0") } }
+  opts.on("--classes PRESET", "Detection classes: bear, person, vehicle, wildlife, all (default: all)") { |v| options[:classes] = v }
+  opts.on("--confidence N", Float, "Confidence threshold (default: 0.25)") { |v| options[:confidence] = v }
+  opts.on("--interval N", Integer, "Minutes between samples (default: 60)") { |v| options[:interval] = v }
+  opts.on("--hour-start N", Integer, "Start hour for scanning (default: 5)") { |v| options[:hour_start] = v }
+  opts.on("--hour-end N", Integer, "End hour for scanning (default: 19)") { |v| options[:hour_end] = v }
+  opts.on("--[no-]save-img", "Save annotated images (default: true)") { |v| options[:save_img] = v }
+  opts.on("--[no-]diff", "Enable/disable diff filtering (default: enabled)") { |v| options[:diff] = v }
+  opts.on("-h", "--help", "Show help") { puts opts; exit }
+end
+parser.parse!
+
+fetcher = FindingKuma::ImageFetcher.new
+detector = FindingKuma::Detector.new(
+  confidence: options[:confidence],
+  save_img: options[:save_img],
+  results_dir: options[:results_dir],
+  classes: options[:classes],
+)
+
+sites = if options[:sites]
+  options[:sites]
+else
+  fetcher.fetch_sites.map { |s| s[:id] }
+end
+
+def build_schedule(days:, interval:, hour_start:, hour_end:)
+  schedule = []
+  now = Time.now
+  (0..days).each do |d|
+    date = now - (d * 86400)
+    (hour_start...hour_end).each do |hour|
+      (0...60).step(interval) do |min|
+        t = Time.new(date.year, date.month, date.day, hour, min, 0)
+        rounded_min = (t.min / 5) * 5
+        t = Time.new(t.year, t.month, t.day, t.hour, rounded_min, 0)
+        schedule << t if t < now
+      end
+    end
+  end
+  schedule.uniq.sort
+end
+
+schedule = build_schedule(
+  days: options[:days],
+  interval: options[:interval],
+  hour_start: options[:hour_start],
+  hour_end: options[:hour_end],
+)
+
+total = sites.size * schedule.size
+log_path = File.join(options[:results_dir], "batch_scan.log")
+FileUtils.mkdir_p(options[:results_dir])
+
+puts "Batch Scan Configuration:"
+puts "  Sites: #{sites.size}"
+puts "  Time range: #{schedule.first&.strftime('%Y/%m/%d %H:%M')} - #{schedule.last&.strftime('%Y/%m/%d %H:%M')}"
+puts "  Samples per site: #{schedule.size}"
+puts "  Total images to scan: #{total}"
+puts "  Classes: #{options[:classes]}"
+puts "  Confidence: #{options[:confidence]}"
+puts "  Diff filtering: #{options[:diff] ? 'ON' : 'OFF'}"
+puts "  Results: #{options[:results_dir]}"
+puts "  Log: #{log_path}"
+puts
+
+scanned = 0
+detected_total = 0
+filtered_total = 0
+errors = 0
+
+File.open(log_path, "a") do |log|
+  log.puts "=== Batch scan started at #{Time.now} ==="
+  log.puts "Sites: #{sites.join(',')}, Days: #{options[:days]}, Classes: #{options[:classes]}, Diff: #{options[:diff]}"
+  log.flush
+
+  sites.each do |site_id|
+    prev_path = nil  # Previous image for diff comparison
+
+    schedule.each_with_index do |time, idx|
+      scanned += 1
+      time_str = time.strftime("%Y/%m/%d %H:%M")
+      progress = format("[%d/%d %.1f%%]", scanned, total, scanned.to_f / total * 100)
+
+      begin
+        path = fetcher.fetch_image(site_id, time)
+        unless path
+          next
+        end
+
+        # Use diff filtering: pass previous image as baseline
+        baseline = (options[:diff] && prev_path && File.exist?(prev_path)) ? prev_path : nil
+        result = detector.detect(path, baseline: baseline)
+
+        if result["error"]
+          errors += 1
+          log.puts "#{time_str} site=#{site_id} ERROR: #{result['error']}"
+          log.flush
+          next
+        end
+
+        diff_filtered = result["diff_filtered"] || 0
+        filtered_total += diff_filtered
+        count = result["detection_count"] || 0
+
+        if count > 0
+          detected_total += 1
+          classes_found = result["detections"].map { |d| "#{d['class']}(#{d['confidence']})" }.join(", ")
+          diff_info = diff_filtered > 0 ? " [filtered:#{diff_filtered}]" : ""
+          msg = "#{progress} DETECTED site=#{site_id} #{time_str}: #{classes_found}#{diff_info}"
+          puts msg
+          log.puts msg
+          log.puts "  image: #{result['image_path']}"
+          log.puts "  saved: #{result['saved_image']}" if result["saved_image"]
+          log.flush
+        else
+          diff_info = diff_filtered > 0 ? " [filtered:#{diff_filtered}]" : ""
+          print "\r#{progress} site=#{site_id} #{time_str}: -#{diff_info}"
+        end
+
+        # Keep current image as baseline for next iteration, delete old baseline
+        if options[:diff]
+          File.delete(prev_path) if prev_path && prev_path != path && count == 0 && File.exist?(prev_path)
+          prev_path = path
+        else
+          File.delete(path) if count == 0 && File.exist?(path)
+        end
+
+      rescue => e
+        errors += 1
+        log.puts "#{time_str} site=#{site_id} EXCEPTION: #{e.message}"
+        log.flush
+      end
+    end
+
+    # Cleanup last baseline image for this site
+    File.delete(prev_path) if prev_path && File.exist?(prev_path) && options[:diff]
+    prev_path = nil
+  end
+
+  puts
+  puts "=" * 60
+  puts "Scan complete!"
+  puts "  Scanned: #{scanned}"
+  puts "  Detected: #{detected_total}"
+  puts "  Diff-filtered: #{filtered_total}"
+  puts "  Errors: #{errors}"
+  puts "  Log: #{log_path}"
+
+  log.puts "=== Batch scan finished at #{Time.now} ==="
+  log.puts "Scanned: #{scanned}, Detected: #{detected_total}, Diff-filtered: #{filtered_total}, Errors: #{errors}"
+end

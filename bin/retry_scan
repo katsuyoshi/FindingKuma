@@ -1,0 +1,102 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Retry failed scans from a CSV list of site_id,timestamp pairs.
+# Usage: ruby bin/retry_scan /tmp/retry_list.csv
+
+require "time"
+require "fileutils"
+require_relative "../lib/finding_kuma/image_fetcher"
+require_relative "../lib/finding_kuma/detector"
+
+csv_path = ARGV[0] || "/tmp/retry_list.csv"
+unless File.exist?(csv_path)
+  puts "Usage: ruby bin/retry_scan <retry_list.csv>"
+  exit 1
+end
+
+entries = File.readlines(csv_path).map(&:strip).reject(&:empty?).map do |line|
+  site, ts = line.split(",")
+  time = Time.new(ts[0..3].to_i, ts[4..5].to_i, ts[6..7].to_i, ts[8..9].to_i, ts[10..11].to_i, 0)
+  { site: site, time: time }
+end
+
+results_dir = File.expand_path("../results", __dir__)
+log_path = File.join(results_dir, "batch_scan.log")
+FileUtils.mkdir_p(results_dir)
+
+fetcher = FindingKuma::ImageFetcher.new
+detector = FindingKuma::Detector.new(
+  confidence: 0.3,
+  save_img: true,
+  results_dir: results_dir,
+  classes: "all",
+)
+
+total = entries.size
+puts "Retry scan: #{total} entries"
+puts
+
+scanned = 0
+detected = 0
+errors = 0
+
+File.open(log_path, "a") do |log|
+  log.puts "=== Retry scan started at #{Time.now} (#{total} entries) ==="
+  log.flush
+
+  entries.each do |entry|
+    scanned += 1
+    site_id = entry[:site]
+    time = entry[:time]
+    time_str = time.strftime("%Y/%m/%d %H:%M")
+    progress = format("[%d/%d %.1f%%]", scanned, total, scanned.to_f / total * 100)
+
+    begin
+      path = fetcher.fetch_image(site_id, time)
+      unless path
+        next
+      end
+
+      result = detector.detect(path)
+
+      if result["error"]
+        errors += 1
+        log.puts "#{time_str} site=#{site_id} ERROR: #{result['error']}"
+        log.flush
+        next
+      end
+
+      count = result["detection_count"] || 0
+      if count > 0
+        detected += 1
+        classes_found = result["detections"].map { |d| "#{d['class']}(#{d['confidence']})" }.join(", ")
+        msg = "#{progress} DETECTED site=#{site_id} #{time_str}: #{classes_found}"
+        puts msg
+        log.puts msg
+        log.puts "  image: #{result['image_path']}"
+        log.puts "  saved: #{result['saved_image']}" if result["saved_image"]
+        log.flush
+      else
+        print "\r#{progress} site=#{site_id} #{time_str}: -"
+      end
+
+      File.delete(path) if count == 0 && File.exist?(path)
+
+    rescue => e
+      errors += 1
+      log.puts "#{time_str} site=#{site_id} RETRY_ERROR: #{e.message}"
+      log.flush
+    end
+  end
+
+  puts
+  puts "=" * 60
+  puts "Retry complete!"
+  puts "  Scanned: #{scanned}"
+  puts "  Detected: #{detected}"
+  puts "  Errors: #{errors}"
+
+  log.puts "=== Retry scan finished at #{Time.now} ==="
+  log.puts "Scanned: #{scanned}, Detected: #{detected}, Errors: #{errors}"
+end

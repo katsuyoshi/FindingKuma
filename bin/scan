@@ -1,0 +1,139 @@
+#!/usr/bin/env ruby
+require "optparse"
+require_relative "../lib/finding_kuma/image_fetcher"
+require_relative "../lib/finding_kuma/detector"
+
+options = {
+  confidence: 0.3,
+  save_img: false,
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: ruby bin/scan [options]"
+
+  opts.on("--site SITE_ID", "Camera site ID (e.g., 050)") { |v| options[:site] = v }
+  opts.on("--all", "Scan all camera sites (latest image)") { options[:all] = true }
+  opts.on("--hours N", Integer, "Scan past N hours of images") { |v| options[:hours] = v }
+  opts.on("--list", "List all camera sites") { options[:list] = true }
+  opts.on("--confidence N", Float, "Detection confidence threshold (default: 0.3)") { |v| options[:confidence] = v }
+  opts.on("--save-img", "Save annotated images with bounding boxes") { options[:save_img] = true }
+  opts.on("-h", "--help", "Show help") do
+    puts opts
+    exit
+  end
+end
+parser.parse!
+
+fetcher = FindingKuma::ImageFetcher.new
+detector = FindingKuma::Detector.new(
+  confidence: options[:confidence],
+  save_img: options[:save_img],
+)
+
+if options[:list]
+  sites = fetcher.fetch_sites
+  puts format("%-4s %-14s %-10s %-12s %s", "ID", "Name", "City", "River", "Status")
+  puts "-" * 60
+  sites.each do |site|
+    puts format("%-4s %-14s %-10s %-12s %s", site[:id], site[:name], site[:city], site[:river], site[:status])
+  end
+  exit
+end
+
+if options[:all]
+  sites = fetcher.fetch_sites
+  puts "Scanning all #{sites.size} camera sites..."
+  puts
+
+  sites.each do |site|
+    path = fetcher.fetch_image(site[:id], round_to_5min(Time.now))
+    unless path
+      puts "  [SKIP] Site #{site[:id]} (#{site[:name]}): image not available"
+      next
+    end
+
+    result = detector.detect(path)
+    if result["bear_count"] && result["bear_count"] > 0
+      puts "  [BEAR!] Site #{site[:id]} (#{site[:name]}) - #{result['bear_count']} bear(s) detected!"
+      result["detections"].each do |det|
+        puts "          confidence: #{det['confidence']}, bbox: #{det['bbox']}"
+      end
+      puts "          saved: #{result['saved_image']}" if result["saved_image"]
+    else
+      puts "  [  OK ] Site #{site[:id]} (#{site[:name]}): no bears"
+    end
+  end
+  exit
+end
+
+unless options[:site]
+  puts parser
+  exit 1
+end
+
+site_id = options[:site].rjust(3, "0")
+
+if options[:hours]
+  puts "Scanning site #{site_id} for the past #{options[:hours]} hour(s)..."
+  images = fetcher.fetch_recent(site_id, hours: options[:hours])
+  puts "Fetched #{images.size} images."
+  puts
+
+  bear_found = false
+  images.each do |img|
+    time_str = img[:time].strftime("%Y/%m/%d %H:%M")
+    result = detector.detect(img[:path])
+
+    if result["bear_count"] && result["bear_count"] > 0
+      bear_found = true
+      puts "  [BEAR!] #{time_str}"
+      result["detections"].each do |det|
+        puts "          confidence: #{det['confidence']}, bbox: #{det['bbox']}"
+      end
+      puts "          saved: #{result['saved_image']}" if result["saved_image"]
+    else
+      puts "  [  OK ] #{time_str}"
+    end
+  end
+
+  puts
+  puts bear_found ? "Bears were detected!" : "No bears found in the scanned period."
+else
+  now = round_to_5min(Time.now)
+  puts "Fetching latest image for site #{site_id}..."
+  path = fetcher.fetch_image(site_id, now)
+
+  unless path
+    puts "Failed to fetch image."
+    exit 1
+  end
+
+  puts "Image saved: #{path}"
+  puts "Running bear detection..."
+
+  result = detector.detect(path)
+
+  if result["error"]
+    puts "Error: #{result['error']}"
+    exit 1
+  end
+
+  if result["bear_count"] > 0
+    puts
+    puts "BEAR DETECTED! (#{result['bear_count']} bear(s))"
+    result["detections"].each do |det|
+      puts "  confidence: #{det['confidence']}, bbox: #{det['bbox']}"
+    end
+    puts "  saved: #{result['saved_image']}" if result["saved_image"]
+  else
+    puts "No bears detected."
+  end
+end
+
+BEGIN {
+  def round_to_5min(time)
+    min = time.min
+    rounded_min = (min / 5) * 5
+    Time.new(time.year, time.month, time.day, time.hour, rounded_min, 0)
+  end
+}

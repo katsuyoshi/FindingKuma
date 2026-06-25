@@ -1,0 +1,50 @@
+name: FindingKuma Monitor
+
+on:
+  schedule:
+    # Run every hour during JST daytime (5:00-19:00 JST = 20:00-10:00 UTC)
+    - cron: '0 20-23,0-10 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache YOLOv8 model
+        uses: actions/cache@v4
+        with:
+          path: yolov8n.pt
+          key: yolov8n-model
+
+      - name: Run monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python3 scripts/monitor.py \
+            --source river \
+            --classes japan \
+            --confidence 0.3 \
+            --notify-classes bear,wildlife \
+            --results-dir results
+
+      - name: Upload detected images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: detections-${{ github.run_number }}
+          path: results/detected_*.jpg
+          retention-days: 30
+          if-no-files-found: ignore
