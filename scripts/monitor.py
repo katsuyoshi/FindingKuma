@@ -166,7 +166,10 @@ def send_discord_notification(webhook_url, camera_name, detections, image_path,
     req = urllib.request.Request(
         webhook_url,
         data=full_body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "FindingKuma/1.0",
+        },
         method="POST",
     )
 
