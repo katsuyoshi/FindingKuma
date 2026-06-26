@@ -38,8 +38,9 @@ CLASS_PRESETS = {
     "vehicle": [2, 3, 5, 7],
     "wildlife": [14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
     "all": [0, 1, 2, 3, 5, 7, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
-    # Japan-realistic: excludes giraffe, zebra, elephant (common false positives from text overlays)
-    "japan": [0, 1, 2, 3, 5, 7, 14, 15, 16, 17, 18, 19, 21],
+    # Japan-realistic: excludes giraffe, zebra, elephant, sheep, cow
+    # (false positives from text overlays and vegetation)
+    "japan": [0, 1, 2, 3, 5, 7, 14, 15, 16, 17, 21],
 }
 
 CLASS_COLORS = {
