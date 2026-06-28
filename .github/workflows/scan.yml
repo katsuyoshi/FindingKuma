@@ -34,7 +34,7 @@ jobs:
             --source river \
             --hours 1 \
             --classes japan \
-            --confidence 0.5 \
+            --confidence 0.4 \
             --notify-classes bear,wildlife \
             --results-dir results
 
