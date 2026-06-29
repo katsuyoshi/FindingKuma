@@ -1,5 +1,10 @@
 images/
 results/
+results_*/
+runs/
+datasets/
+bear_test_*.jpg
+test_*.jpg
 *.pt
 *.onnx
 __pycache__/

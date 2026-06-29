@@ -204,6 +204,151 @@ https://kasen.pref.akita.lg.jp/pc/data/itv.json
 | 地図データJS | `/sp/js/map.js` | 地図上の各種データURL定義 |
 | 地図レイヤーJS | `/sp/js/map-ol.js` | OpenLayers地図レイヤー管理 |
 
+## クマ検知モデル
+
+### モデル構成
+
+| 項目 | COCOモデル | カスタムモデル |
+|------|-----------|-------------|
+| ファイル | `yolov8n.pt` | `runs/detect/bear_detector/weights/best.pt` |
+| サイズ | 6.2MB | 6.0MB |
+| ベース | YOLOv8n（COCO pretrained） | YOLOv8n（fine-tuned） |
+| クラス数 | 80クラス（bearはID=21） | 1クラス（bearはID=0） |
+| 学習データ | COCO（33万枚） | Roboflow Bear Dataset v3（1,153枚） |
+| 推論速度 | 約60ms/枚 | 約61ms/枚 |
+
+### カスタムモデルの作成
+
+#### 前提条件
+
+- Python 3.11+
+- `pip install ultralytics roboflow`
+- Roboflow APIキー（[https://app.roboflow.com/settings/api](https://app.roboflow.com/settings/api) で無料取得）
+
+#### 学習データ
+
+[Roboflow Universe](https://universe.roboflow.com/yolov8-testing-suwzp/bear-dataset/dataset/3) の Bear Dataset v3 を使用。
+
+| 項目 | 値 |
+|------|-----|
+| 画像数 | 1,153枚 |
+| クラス数 | 1（bear） |
+| アノテーション形式 | YOLOv8（class_id cx cy w h） |
+| 分割 | train / valid / test |
+
+#### 手順
+
+**1. データセットのダウンロード**
+
+```bash
+export ROBOFLOW_API_KEY="your_api_key"
+python3 scripts/train.py --download
+```
+
+`datasets/raw/bear-dataset/` にダウンロードされ、`datasets/bear/` に統合データセットが作成される。
+
+**2. 学習の実行**
+
+```bash
+# デフォルト設定（100エポック）
+python3 scripts/train.py --train
+
+# エポック数・バッチサイズ指定
+python3 scripts/train.py --train --epochs 50 --batch 8
+
+# データセットとベースモデル指定
+python3 scripts/train.py --train --data datasets/bear/data.yaml --model yolov8n.pt
+```
+
+| パラメータ | デフォルト | 説明 |
+|-----------|----------|------|
+| `--epochs` | 100 | 学習エポック数 |
+| `--batch` | 16 | バッチサイズ（GPUメモリに応じて調整） |
+| `--imgsz` | 640 | 入力画像サイズ |
+| `--model` | `yolov8n.pt` | ベースモデル |
+| `--data` | `datasets/bear/data.yaml` | データセット設定ファイル |
+
+学習にはearly stopping（`patience=30`）が設定されており、検証指標が30エポック改善しなければ自動停止する。
+
+**3. モデルの評価**
+
+```bash
+python3 scripts/train.py --eval --model runs/detect/bear_detector/weights/best.pt
+```
+
+**4. ローカル画像の追加学習**
+
+独自に収集・アノテーションした画像を追加できる。
+
+```bash
+# images/ と labels/ を含むディレクトリを指定
+python3 scripts/train.py --add-local path/to/annotated_data
+
+# 追加後に再学習
+python3 scripts/train.py --train
+```
+
+ラベル形式（YOLO）: 1行につき `class_id center_x center_y width height`（0〜1に正規化）
+
+#### 出力
+
+学習完了後のモデルは以下に保存される:
+```
+runs/detect/bear_detector/
+├── weights/
+│   ├── best.pt          # 最良モデル（検証mAP最高値）
+│   └── last.pt          # 最終エポックのモデル
+├── results.csv          # エポックごとの指標
+├── confusion_matrix.png # 混同行列
+├── F1_curve.png         # F1カーブ
+├── PR_curve.png         # Precision-Recallカーブ
+└── results.png          # 学習推移グラフ
+```
+
+#### 学習結果（50エポック、M1 Mac CPU）
+
+| 指標 | 値 |
+|------|-----|
+| mAP50 | 0.877 |
+| mAP50-95 | 0.629 |
+| Precision | 0.858 |
+| Recall | 0.806 |
+
+### デュアルモデル検知
+
+両モデルを併用し、検出結果をマージすることで検知精度を最大化する。
+
+```
+python3 scripts/monitor.py \
+  --model yolov8n.pt \
+  --dual-model runs/detect/bear_detector/weights/best.pt \
+  --confidence 0.4
+```
+
+**マージロジック**:
+- 同じクラス・重複位置（IoU >= 0.5）→ 信頼度が高い方を採用
+- 片方のモデルのみが検出 → そのまま追加
+
+### 検知精度比較（ツキノワグマ画像テスト）
+
+| テスト画像 | COCOモデル | カスタムモデル | デュアル（マージ） |
+|-----------|-----------|-------------|----------------|
+| ツキノワグマ（緑の植生） | bear 92.7% | bear 84.9% | bear 92.7% |
+| 森の中の2頭のクマ | bear 82.0% + 66.8%（2頭） | bear 78.4%（1頭のみ） | bear 82.0% + 66.8%（2頭） |
+| ガードレール付近のクマ | bear 86.2% | bear 65.8% | bear 86.2% |
+| 茂みに隠れたクマ | 検知なし（見逃し） | bear 42.6% | bear 42.6% |
+
+**結果**: デュアルモデルは全4枚で全てのクマを検出。COCOモデルが見逃す隠れたクマをカスタムモデルが補完し、カスタムモデルが見逃す複数頭の検出をCOCOモデルが補完する。
+
+### モデル特性まとめ
+
+| 特性 | COCOモデル | カスタムモデル |
+|------|-----------|-------------|
+| 信頼度 | 高い（82〜93%） | やや低い（43〜85%） |
+| 複数頭の検出 | 得意 | 見逃す場合あり |
+| 隠れたクマ・低コントラスト | 見逃す場合あり | 検出可能 |
+| 誤検知（river camera） | japanプリセットで抑制済み | 低い |
+
 ## 備考
 
 - UIでは「過去24時間のカメラ画像を確認することができます」と表示されるが、サーバー上には約1ヶ月分の画像が保存されている

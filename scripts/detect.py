@@ -56,6 +56,7 @@ DEFAULT_COLOR = (0, 200, 255)
 
 # Static detection filtering parameters
 STATIC_IOU_THRESHOLD = 0.5  # IoU threshold to consider two detections as "same position"
+MERGE_IOU_THRESHOLD = 0.5   # IoU threshold for merging dual-model detections
 
 
 def compute_iou(bbox1, bbox2):
@@ -73,6 +74,28 @@ def compute_iou(bbox1, bbox2):
     if union == 0:
         return 0.0
     return intersection / union
+
+
+def merge_detections(dets_a, dets_b):
+    """Merge detections from two models, deduplicating overlapping bear boxes.
+
+    For overlapping detections (same class, IoU >= threshold), keeps the one
+    with higher confidence. Non-overlapping detections from both are kept.
+    """
+    merged = list(dets_a)
+    for det_b in dets_b:
+        is_dup = False
+        for i, det_a in enumerate(merged):
+            if det_a["class"] == det_b["class"]:
+                if compute_iou(det_a["bbox"], det_b["bbox"]) >= MERGE_IOU_THRESHOLD:
+                    # Keep the higher-confidence detection
+                    if det_b["confidence"] > det_a["confidence"]:
+                        merged[i] = det_b
+                    is_dup = True
+                    break
+        if not is_dup:
+            merged.append(det_b)
+    return merged
 
 
 def detect_baseline(baseline_path, confidence, target_classes, model):
@@ -102,11 +125,12 @@ def is_static_detection(det_bbox, det_cls_id, baseline_dets):
 
 
 def detect(image_path, baseline_path=None, confidence=0.3, target_classes=None,
-           save_img=False, results_dir="results"):
+           save_img=False, results_dir="results", model_path="yolov8n.pt"):
     if target_classes is None:
         target_classes = CLASS_PRESETS["all"]
 
-    model = YOLO("yolov8n.pt")
+    model = YOLO(model_path)
+    is_custom = model_path != "yolov8n.pt"
     results = model(image_path, conf=confidence, verbose=False)
 
     # Run detection on baseline for static-object filtering
@@ -122,7 +146,10 @@ def detect(image_path, baseline_path=None, confidence=0.3, target_classes=None,
             if cls_id not in target_classes:
                 continue
 
-            cls_name = COCO_NAMES.get(cls_id, f"class_{cls_id}")
+            if is_custom:
+                cls_name = model.names.get(cls_id, f"class_{cls_id}")
+            else:
+                cls_name = COCO_NAMES.get(cls_id, f"class_{cls_id}")
             conf = float(box.conf[0])
             x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
             bbox = [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)]
@@ -182,6 +209,7 @@ def main():
     parser.add_argument("--classes", default="all", help="Class preset: bear, person, vehicle, wildlife, japan, all")
     parser.add_argument("--save-img", action="store_true", help="Save annotated image to results/")
     parser.add_argument("--results-dir", default="results", help="Directory to save results")
+    parser.add_argument("--model", default="yolov8n.pt", help="Model path (default: yolov8n.pt)")
     args = parser.parse_args()
 
     image_path = Path(args.image_path)
@@ -189,13 +217,17 @@ def main():
         print(json.dumps({"error": f"Image not found: {args.image_path}"}))
         sys.exit(1)
 
-    target_classes = CLASS_PRESETS.get(args.classes)
-    if target_classes is None:
-        try:
-            target_classes = [int(c) for c in args.classes.split(",")]
-        except ValueError:
-            print(json.dumps({"error": f"Unknown class preset: {args.classes}"}))
-            sys.exit(1)
+    # Custom models have their own class IDs (e.g., 0=bear), so skip preset filtering
+    if args.model != "yolov8n.pt":
+        target_classes = None  # Accept all classes from custom model
+    else:
+        target_classes = CLASS_PRESETS.get(args.classes)
+        if target_classes is None:
+            try:
+                target_classes = [int(c) for c in args.classes.split(",")]
+            except ValueError:
+                print(json.dumps({"error": f"Unknown class preset: {args.classes}"}))
+                sys.exit(1)
 
     output = detect(
         str(image_path),
@@ -204,6 +236,7 @@ def main():
         target_classes=target_classes,
         save_img=args.save_img,
         results_dir=args.results_dir,
+        model_path=args.model,
     )
 
     print(json.dumps(output, ensure_ascii=False))

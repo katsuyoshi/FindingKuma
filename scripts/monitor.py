@@ -37,7 +37,7 @@ import cv2
 
 # Import detection logic from detect.py
 sys.path.insert(0, str(Path(__file__).parent))
-from detect import CLASS_PRESETS, COCO_NAMES, CLASS_COLORS, DEFAULT_COLOR
+from detect import CLASS_PRESETS, COCO_NAMES, CLASS_COLORS, DEFAULT_COLOR, merge_detections
 
 JST = timezone(timedelta(hours=9))
 
@@ -202,16 +202,19 @@ def annotate_image(image_path, detections, save_path):
     cv2.imwrite(str(save_path), img)
 
 
-def run_detection(model, image_path, target_classes, confidence):
+def run_detection(model, image_path, target_classes, confidence, is_custom=False):
     """Run YOLO detection on a single image."""
     results = model(str(image_path), conf=confidence, verbose=False)
     detections = []
     for result in results:
         for box in result.boxes:
             cls_id = int(box.cls[0])
-            if cls_id not in target_classes:
+            if not is_custom and cls_id not in target_classes:
                 continue
-            cls_name = COCO_NAMES.get(cls_id, f"class_{cls_id}")
+            if is_custom:
+                cls_name = model.names.get(cls_id, f"class_{cls_id}")
+            else:
+                cls_name = COCO_NAMES.get(cls_id, f"class_{cls_id}")
             conf = float(box.conf[0])
             x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
             detections.append({
@@ -239,6 +242,10 @@ def main():
                         help="Classes to notify on (comma-separated, default: bear,wildlife)")
     parser.add_argument("--results-dir", default=None,
                         help="Directory to save detected images")
+    parser.add_argument("--model", default="yolov8n.pt",
+                        help="Model path (default: yolov8n.pt)")
+    parser.add_argument("--dual-model", default=None,
+                        help="Second model path for dual-model detection (results merged)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Run detection but don't send notifications")
     args = parser.parse_args()
@@ -272,9 +279,17 @@ def main():
     if results_dir:
         results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model once
-    print("Loading YOLOv8 model...")
-    model = YOLO("yolov8n.pt")
+    # Load model(s)
+    is_custom = args.model != "yolov8n.pt"
+    print(f"Loading model: {args.model}")
+    model = YOLO(args.model)
+
+    dual_model = None
+    dual_is_custom = False
+    if args.dual_model:
+        dual_is_custom = args.dual_model != "yolov8n.pt"
+        print(f"Loading dual model: {args.dual_model}")
+        dual_model = YOLO(args.dual_model)
 
     now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M JST")
     slots = int(args.hours * 12)
@@ -315,7 +330,12 @@ def main():
                         continue
 
                     scanned += 1
-                    detections = run_detection(model, str(img_path), target_classes, args.confidence)
+                    detections = run_detection(model, str(img_path), target_classes, args.confidence, is_custom)
+
+                    # Dual-model: run second model and merge results
+                    if dual_model:
+                        dets2 = run_detection(dual_model, str(img_path), target_classes, args.confidence, dual_is_custom)
+                        detections = merge_detections(detections, dets2)
 
                     if not detections:
                         continue
@@ -325,8 +345,13 @@ def main():
                     progress = f"[{count}/{total}]"
                     print(f"  {progress} {site['id']} {cam_name} {time_label}: {det_str}")
 
-                    # Check if any detection is notification-worthy
-                    notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
+                    # Check if any detection is notification-worthy (bear class from either model)
+                    notify_dets = [d for d in detections if d["class"] == "bear"]
+                    if not notify_dets:
+                        if is_custom or dual_is_custom:
+                            notify_dets = detections
+                        else:
+                            notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
 
                     if notify_dets:
                         annotated_path = Path(tmpdir) / f"detected_{fname}"
@@ -364,7 +389,12 @@ def main():
                     continue
 
                 scanned += 1
-                detections = run_detection(model, str(img_path), target_classes, args.confidence)
+                detections = run_detection(model, str(img_path), target_classes, args.confidence, is_custom)
+
+                # Dual-model: run second model and merge results
+                if dual_model:
+                    dets2 = run_detection(dual_model, str(img_path), target_classes, args.confidence, dual_is_custom)
+                    detections = merge_detections(detections, dets2)
 
                 if not detections:
                     continue
@@ -373,7 +403,12 @@ def main():
                 det_str = ", ".join(f"{d['class']}({d['confidence']})" for d in detections)
                 print(f"  {cam_id} {cam_name}: {det_str}")
 
-                notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
+                notify_dets = [d for d in detections if d["class"] == "bear"]
+                if not notify_dets:
+                    if is_custom or dual_is_custom:
+                        notify_dets = detections
+                    else:
+                        notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
 
                 if notify_dets:
                     annotated_path = Path(tmpdir) / f"detected_{cam_id}.jpg"
