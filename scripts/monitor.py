@@ -37,7 +37,8 @@ import cv2
 
 # Import detection logic from detect.py
 sys.path.insert(0, str(Path(__file__).parent))
-from detect import CLASS_PRESETS, COCO_NAMES, CLASS_COLORS, DEFAULT_COLOR, merge_detections
+from detect import (CLASS_PRESETS, COCO_NAMES, CLASS_COLORS, DEFAULT_COLOR,
+                     merge_detections, compute_iou, STATIC_IOU_THRESHOLD)
 
 JST = timezone(timedelta(hours=9))
 
@@ -315,6 +316,8 @@ def main():
             print()
 
             count = 0
+            notified_by_site = {}  # site_id -> list of {class, bbox}
+
             for site in sites:
                 schedule = build_river_schedule(site["id"], args.hours)
                 cam_name = f"{site['river']} {site['name']}"
@@ -345,13 +348,22 @@ def main():
                     progress = f"[{count}/{total}]"
                     print(f"  {progress} {site['id']} {cam_name} {time_label}: {det_str}")
 
-                    # Check if any detection is notification-worthy (bear class from either model)
-                    notify_dets = [d for d in detections if d["class"] == "bear"]
-                    if not notify_dets:
-                        if is_custom or dual_is_custom:
-                            notify_dets = detections
-                        else:
-                            notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
+                    # Check if any detection is notification-worthy
+                    notify_dets = [d for d in detections
+                                   if d["class"] == "bear" or d.get("class_id") in notify_class_ids]
+
+                    # Skip if same detections were already notified for this site
+                    prev = notified_by_site.get(site["id"], [])
+                    new_dets = []
+                    for det in notify_dets:
+                        already = False
+                        for p in prev:
+                            if det["class"] == p["class"] and compute_iou(det["bbox"], p["bbox"]) >= STATIC_IOU_THRESHOLD:
+                                already = True
+                                break
+                        if not already:
+                            new_dets.append(det)
+                    notify_dets = new_dets
 
                     if notify_dets:
                         annotated_path = Path(tmpdir) / f"detected_{fname}"
@@ -371,6 +383,9 @@ def main():
                                 print(f"    -> Discord notification sent")
                             else:
                                 print(f"    -> Discord notification failed")
+
+                        # Record notified detections for this site
+                        notified_by_site.setdefault(site["id"], []).extend(notify_dets)
 
                     # Clean up image to save disk
                     if img_path.exists() and not detections:
@@ -403,12 +418,8 @@ def main():
                 det_str = ", ".join(f"{d['class']}({d['confidence']})" for d in detections)
                 print(f"  {cam_id} {cam_name}: {det_str}")
 
-                notify_dets = [d for d in detections if d["class"] == "bear"]
-                if not notify_dets:
-                    if is_custom or dual_is_custom:
-                        notify_dets = detections
-                    else:
-                        notify_dets = [d for d in detections if d["class_id"] in notify_class_ids]
+                notify_dets = [d for d in detections
+                               if d["class"] == "bear" or d.get("class_id") in notify_class_ids]
 
                 if notify_dets:
                     annotated_path = Path(tmpdir) / f"detected_{cam_id}.jpg"
