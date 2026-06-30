@@ -20,20 +20,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Cache models
-        id: cache-models
+      - name: Cache YOLOv8 model
         uses: actions/cache@v4
         with:
-          path: |
-            yolov8n.pt
-            bear_detector.pt
-          key: models-yolov8n-bear-v1
-
-      - name: Download custom model from release
-        if: steps.cache-models.outputs.cache-hit != 'true'
-        run: gh release download model-v1 -p 'bear_detector.pt' -O bear_detector.pt
-        env:
-          GH_TOKEN: ${{ github.token }}
+          path: yolov8n.pt
+          key: yolov8n-model
 
       - name: Run monitor
         env:
@@ -45,7 +36,6 @@ jobs:
             --classes japan \
             --confidence 0.4 \
             --notify-classes bear,wildlife \
-            --dual-model bear_detector.pt \
             --results-dir results
 
       - name: Upload detected images
